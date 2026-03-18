@@ -505,10 +505,18 @@ static double getDaeUnitMeter(const std::string& filename) {
   if (unit_end == std::string::npos) return 1.0;
   std::string unit_elem = content.substr(unit_pos, unit_end - unit_pos + 1);
 
+  char quote;
   size_t meter_pos = unit_elem.find("meter=\"");
-  if (meter_pos == std::string::npos) return 1.0;
-  meter_pos += 7; // skip meter="
-  size_t meter_end = unit_elem.find("\"", meter_pos);
+  if (meter_pos != std::string::npos) {
+    meter_pos += 7; // skip meter="
+    quote = '"';
+  } else {
+    meter_pos = unit_elem.find("meter='");
+    if (meter_pos == std::string::npos) return 1.0;
+    meter_pos += 7; // skip meter='
+    quote = '\'';
+  }
+  size_t meter_end = unit_elem.find(quote, meter_pos);
   if (meter_end == std::string::npos) return 1.0;
 
   try {
