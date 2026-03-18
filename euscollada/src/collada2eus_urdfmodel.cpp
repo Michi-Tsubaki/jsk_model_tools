@@ -219,7 +219,8 @@ public:
   // methods for parsing robot model for euslisp
   void addLinkCoords();
   void printMesh(const aiScene* scene, const aiNode* node, const Vector3 &scale,
-                 const string &material_name, vector<coordT> &store_pt, bool printq);
+                 const string &material_name, vector<coordT> &store_pt, bool printq,
+                 double unit_scale = 1000.0);
   void readYaml(std::vector<string> &config_file);
 
 #if URDFDOM_1_0_0_API
@@ -474,8 +475,53 @@ void ModelEuslisp::addLinkCoords() {
   }
 }
 
+// Read the <asset><unit meter="..."> value from a COLLADA (.dae) file.
+static double getDaeUnitMeter(const std::string& filename) {
+
+  std::string lower = filename;
+  std::transform(lower.begin(), lower.end(), lower.begin(), ::tolower);
+  size_t ext_pos = lower.rfind('.');
+  if (ext_pos == std::string::npos || lower.substr(ext_pos) != ".dae") return 1.0;
+
+  resource_retriever::Retriever retriever;
+  resource_retriever::MemoryResource res;
+  try {
+    res = retriever.get(filename);
+  } catch (resource_retriever::Exception& e) {
+    ROS_WARN("getDaeUnitMeter: failed to retrieve %s: %s", filename.c_str(), e.what());
+    return 1.0;
+  }
+
+  std::string content(reinterpret_cast<const char*>(res.data.get()), res.size);
+
+  size_t asset_pos = content.find("<asset");
+  if (asset_pos == std::string::npos) return 1.0;
+  size_t asset_end = content.find("</asset>", asset_pos);
+  if (asset_end == std::string::npos) asset_end = content.size();
+
+  size_t unit_pos = content.find("<unit", asset_pos);
+  if (unit_pos == std::string::npos || unit_pos > asset_end) return 1.0;
+  size_t unit_end = content.find(">", unit_pos);
+  if (unit_end == std::string::npos) return 1.0;
+  std::string unit_elem = content.substr(unit_pos, unit_end - unit_pos + 1);
+
+  size_t meter_pos = unit_elem.find("meter=\"");
+  if (meter_pos == std::string::npos) return 1.0;
+  meter_pos += 7; // skip meter="
+  size_t meter_end = unit_elem.find("\"", meter_pos);
+  if (meter_end == std::string::npos) return 1.0;
+
+  try {
+    return std::stod(unit_elem.substr(meter_pos, meter_end - meter_pos));
+  } catch (...) {
+    ROS_WARN("getDaeUnitMeter: failed to parse meter value in %s", filename.c_str());
+    return 1.0;
+  }
+}
+
 void ModelEuslisp::printMesh(const aiScene* scene, const aiNode* node, const Vector3 &scale,
-                             const string &material_name, vector<coordT> &store_pt, bool printq) {
+                             const string &material_name, vector<coordT> &store_pt, bool printq,
+                             double unit_scale) {
   aiMatrix4x4 transform = node->mTransformation;
   aiNode *pnode = node->mParent;
   while (pnode)  {
@@ -564,7 +610,7 @@ void ModelEuslisp::printMesh(const aiScene* scene, const aiNode* node, const Vec
       p *= transform;
       //p *= scale;
       if (printq) fprintf(fp, FLOAT_PRECISION_FINE" "FLOAT_PRECISION_FINE" "FLOAT_PRECISION_FINE" ",
-                          1000 * p.x * scale.x, 1000 * p.y * scale.y, 1000 * p.z * scale.z);
+                          unit_scale * p.x * scale.x, unit_scale * p.y * scale.y, unit_scale * p.z * scale.z);
     }
     if (printq) fprintf(fp, ")) mat))");
 
@@ -596,7 +642,7 @@ void ModelEuslisp::printMesh(const aiScene* scene, const aiNode* node, const Vec
     if (printq) fprintf(fp, ")\n");
   }
   for (uint32_t i = 0; i < node->mNumChildren; ++i) {
-    printMesh(scene, node->mChildren[i], scale, material_name, store_pt, printq);
+    printMesh(scene, node->mChildren[i], scale, material_name, store_pt, printq, unit_scale);
   }
 }
 
@@ -1851,21 +1897,25 @@ void ModelEuslisp::printGeometry (boost::shared_ptr<Geometry> g, const Pose &pos
                                                          ((~aiProcess_GenNormals) & (~aiProcess_GenSmoothNormals)));
 
     Vector3 scale = ((Mesh *)(g.get()))->scale;
+    // Determine unit scale: for DAE files read <asset><unit meter="...">; for other formats assume meters (1.0).
+    // Multiply by 1000 to convert to millimeters (EusLisp internal unit).
+    double unit_scale = getDaeUnitMeter(gname) * 1000.0;
+    ROS_DEBUG("mesh %s: unit_scale = %f", gname.c_str(), unit_scale);
     vector<coordT> points;
     if (scene && scene->HasMeshes() && !use_loadable_mesh) {
       fprintf(fp, "      (setq glv\n");
       fprintf(fp, "       (instance gl::glvertices :init\n");
       fprintf(fp, "                 (list ;; mesh list\n");
       // TODO: use g->scale
-      printMesh(scene, scene->mRootNode, scale, material_name, points, true);
+      printMesh(scene, scene->mRootNode, scale, material_name, points, true, unit_scale);
       fprintf(fp, "                  )\n");
       fprintf(fp, "                 ))\n");
       fprintf(fp, "      (send glv :transform local-cds)\n");
       fprintf(fp, "      (send glv :calc-normals)\n");
     } else if (scene && scene->HasMeshes()) {
       fprintf(fp, "      (setq glv (load-mesh-file (ros::resolve-ros-path \"%s\")\n", gname.c_str());
-      fprintf(fp, "                                       :scale %f :process-max-quality t))\n", scale.x*1000);
-      printMesh(scene, scene->mRootNode, scale, material_name, points, false);
+      fprintf(fp, "                                       :scale %f :process-max-quality t))\n", scale.x*unit_scale);
+      printMesh(scene, scene->mRootNode, scale, material_name, points, false, unit_scale);
       fprintf(fp, "      (send glv :transform local-cds)\n");
       fprintf(fp, "      (send glv :calc-normals)\n");
     } else {
@@ -1883,9 +1933,9 @@ void ModelEuslisp::printGeometry (boost::shared_ptr<Geometry> g, const Pose &pos
           fprintf(fp, "              (instance face :init :vertices\n");
           fprintf(fp, "                (mapcar #'(lambda (v) (send local-cds :transform-vector v))\n");
           fprintf(fp, "                  (list (float-vector "FLOAT_PRECISION_FINE" "FLOAT_PRECISION_FINE" "FLOAT_PRECISION_FINE") (float-vector "FLOAT_PRECISION_FINE" "FLOAT_PRECISION_FINE" "FLOAT_PRECISION_FINE") (float-vector "FLOAT_PRECISION_FINE" "FLOAT_PRECISION_FINE" "FLOAT_PRECISION_FINE"))))\n",
-                  1000*points[i*9+0], 1000*points[i*9+1], 1000*points[i*9+2],
-                  1000*points[i*9+3], 1000*points[i*9+4], 1000*points[i*9+5],
-                  1000*points[i*9+6], 1000*points[i*9+7], 1000*points[i*9+8]);
+                  unit_scale*points[i*9+0], unit_scale*points[i*9+1], unit_scale*points[i*9+2],
+                  unit_scale*points[i*9+3], unit_scale*points[i*9+4], unit_scale*points[i*9+5],
+                  unit_scale*points[i*9+6], unit_scale*points[i*9+7], unit_scale*points[i*9+8]);
         }
         fprintf(fp, "              ))\n");
       } else {
@@ -1901,7 +1951,7 @@ void ModelEuslisp::printGeometry (boost::shared_ptr<Geometry> g, const Pose &pos
           setT *vertices = qh_facet3vertex(facet); // ccw?
           FOREACHvertex_(vertices) {
             fprintf(fp, " (float-vector "FLOAT_PRECISION_FINE" "FLOAT_PRECISION_FINE" "FLOAT_PRECISION_FINE")",
-                    1000*vertex->point[0], 1000*vertex->point[1], 1000*vertex->point[2]);
+                    unit_scale*vertex->point[0], unit_scale*vertex->point[1], unit_scale*vertex->point[2]);
           }
           fprintf(fp, "))))\n");
           qh_settempfree(&vertices);
